@@ -65,7 +65,7 @@ def test_run_end_to_end_writes_candidates(tmp_path):
                     top_n=8, use_ml=True, hub_mod=FakeHub(), min_universe=10)
     assert out["as_of"] == "2026-05-20" and out["picked"] == 8 and out["written"] == 8
     assert out["weights_sum"] == pytest.approx(1.0, rel=1e-6)
-    assert out["ml_scored"] == 8
+    assert out["ml_scored"] == 20, "ML 打在粗筛 20 只上（不是最终 top_n）"
     rows = store.read_candidates(store.connect(tmp_path / "s.db"), out["date"])
     assert len(rows) == 8
     assert all(r["target_weight"] == pytest.approx(0.125) for r in rows)
