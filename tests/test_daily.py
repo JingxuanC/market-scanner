@@ -40,7 +40,8 @@ class FakeHub:
     def ml_predict(self, klines_list, **kw):
         if self.fail_ml:
             raise hub.HubError("model missing")
-        return {"predictions": {k["symbol"]: 0.01 * i for i, k in enumerate(klines_list)}}
+        return {"status": "ok", "n_predicted": len(klines_list),
+                "predictions": {k["symbol"]: 0.01 * i for i, k in enumerate(klines_list)}}
 
     def portfolio_optimize(self, symbols, klines, method="hrp", lookback=120, **kw):
         w = 1.0 / len(symbols)
@@ -91,3 +92,18 @@ def test_run_refuses_degenerate_universe(tmp_path):
 
     with pytest.raises(hub.HubError, match="退化"):
         daily.run(db_path=tmp_path / "s.db", df=df, min_symbols=10, hub_mod=Tiny(), min_universe=10)
+
+
+class SilentMlHub(FakeHub):
+    """复现 hub 曾出现的形状：status=ok 但一只都没算。"""
+    def ml_predict(self, klines_list, **kw):
+        return {"status": "ok", "n_predicted": 0, "predictions": {}}
+
+
+def test_run_treats_ok_but_zero_predicted_as_failure(tmp_path):
+    df = make_df()
+    out = daily.run(db_path=tmp_path / "s.db", df=df, min_symbols=10, shortlist=10,
+                    top_n=3, use_ml=True, hub_mod=SilentMlHub(), min_universe=10)
+    assert any("n_predicted=0" in w for w in out["warnings"]), "ok+0 必须被当成失败报出来"
+    rows = store.read_candidates(store.connect(tmp_path / "s.db"), out["date"])
+    assert all("ml unavailable" in r["reason"] for r in rows)

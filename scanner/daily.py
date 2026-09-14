@@ -116,8 +116,16 @@ def run(h5_path=None, db_path=None, as_of=None, shortlist: int = 200, top_n: int
         if kl:
             try:
                 pred = hub_mod.ml_predict(kl)
-                if isinstance(pred, dict) and pred.get("error"):
-                    raise hub.HubError(pred["error"])
+                if isinstance(pred, dict):
+                    # hub 的错误形状是 {"status":"error","message":...}，不是 {"error":...}；
+                    # 而且它曾返回过 {"status":"ok","n_predicted":0}——**一只都没算却报成功**。
+                    # 两种都必须显式报出来，绝不静默当"ML 没分"。
+                    if pred.get("status") == "error":
+                        raise hub.HubError(pred.get("message") or str(pred))
+                    if pred.get("error"):
+                        raise hub.HubError(str(pred["error"]))
+                    if pred.get("n_predicted") == 0:
+                        raise hub.HubError("ml_predict 返回 ok 但 n_predicted=0（等于没打分）")
                 for s, v in (pred.get("predictions") or pred.get("scores") or {}).items():
                     ml_scores[str(s).upper()] = float(v)
                 if not ml_scores:
