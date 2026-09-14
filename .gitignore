@@ -1,0 +1,18 @@
+# ── 绝不入库：个人资金与持仓（这是本仓唯一的高敏感面）────────────────
+positions.json
+*.positions.json
+trades/*.csv
+*.sqlite
+*.db
+.env
+.env.*
+
+# ── 运行时数据 ──
+data/
+logs/
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+.DS_Store
