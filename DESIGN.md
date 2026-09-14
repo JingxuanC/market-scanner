@@ -111,12 +111,28 @@ T+1 锁的是"当天买的"，**不锁"昨天及以前买的"**。所以有底�
 
 → 输出大约 **3000–4000 只**的可交易域，写进 `universe` 表（每日更新，保留历史以便复盘）。
 
+**状态（2026-09-14 已实现并上线）**：`get_a_trade_universe` 在 hub 上可用，实测
+扫 5544 只 → 通过 **5073**（剔除 ST 320 + 退市 151，逐只核对无误判），耗时 **17.6s**。
+参数：`exclude_st` / `exclude_new_days`(默认 60) / `include_bj` / `min_amount_wan` /
+`exclude_suspended` / `limit`，返回里带**逐项淘汰计数**（`excluded`）以便审计。
+
+⚠️ **注意"数据集 ≠ 可交易域"**：本地 h5/qlib 有 6142 个 instrument，其中 588 是北交所、
+其余还有指数/ETF；真正可交易的 A 股是 5553 只。所以 20:10 读 h5 时最新截面最多
+≈5200 只，**不是 6082**——任何"全市场"分母都要说清用的是哪个集合。
+
 ### 4.2 因子
 
 **不自建因子库**，用 hub 现成的：
 - `factor_daily_compute`（每日 20:00 cron）→ SOTA 因子落 Redis `dfactor:{symbol}`
 - 因子质量监控：`factor_recent_ic`（滚动 IC）+ `factor_tearsheet`（分组/衰减）
 - 因子挖掘与准入：`run_factor_mining`（LLM 提假设 → 沙箱验值 → qlib 全量回测 → OOS 准入）
+
+⚠️ **两个 Redis 命名空间别搞混**（2026-09-14 读代码确认）：
+`dfactor:{symbol}` = **日频**（`factor_daily_compute` 20:00 cron 写，TTL 48h，
+**athena 的 `factor/cache.go` 直接读它喂 WarRoom**）；`factor:{symbol}` = **盘中**
+（TTL 300s，`batch_compute` 写）。而 `ml_predict` 的快路径读的是 **`factor:`（盘中）**，
+所以日频轨调它大概率走 **on-the-fly 回退**（结果对、但慢）。
+→ P2 开工前必须确认 `batch_compute`（`factor:`）到底有没有在跑。
 
 **必须确认/补齐**：因子是否做了 **行业 + 市值中性化**。没有中性化，组合会隐性押注行业和市值风格，
 回撤时会集中爆发（2024 年初小市值踩踏就是典型）。→ 列为 Phase 1 的**验收项**。
@@ -138,6 +154,13 @@ alpha = 分位映射(z)             # 截面 rank → [-1, 1]
       → 进阶：max αᵀw − λ·wᵀΣw  s.t. 见 §8 约束
 输出：目标权重向量（不是 TopN 列表）
 ```
+
+⚠️ **hub 真实接口与上式有差**（2026-09-14 查 schema）：
+`portfolio_optimize(symbols, klines, method∈{hrp,equal,min_variance,mean_variance}, lookback=120)`
+——它吃的是 **klines（价格→协方差）**，**没有 alpha/期望收益入参**。所以：
+- **起步只能用 HRP / min_variance（纯风险配置）**，`lookback=120` 与 §12 一致；
+- **alpha 倾斜（αᵀw）hub 现在给不了** → 要么在 scanner 本地实现（scipy/cvxpy，~50 行），
+  要么请 hub 给 `mean_variance` 加 `mu` 入参。**降级为 P5 升级项**，别在 P2 假装有。
 
 **这是"选股"真正的产出**。Top5 等权是 athena 的老做法，也是散户的典型做法——它把
 "选股"和"配置"混成一步，结果单票风险巨大且无法控制行业暴露。
@@ -368,6 +391,26 @@ for an array with shape (6, 15095115) and data type float32
 
 ---
 
+## 14. P0 现实核对（2026-09-14，与 §13 同源）
+
+§13 那句"**P1/P2 开工前必须先确认 P0 的产出真的落地**"，当天就被验证是对的——
+而且比预想的多查出 3 个缺陷（都不是"没写代码"，是"写了但没在跑/在悄悄跑坏"）：
+
+| # | 缺陷 | 机制 | 修法 |
+|---|---|---|---|
+| 1 | **universe 静默退化** | 东财 clist 会把分页静默截断（`pz=500` 只回 100 行，异常时只回 **2 行**），旧代码 `if len(diff) < pz: break` 把短页当"列表到底了" → "全市场"退化成 2 只，而**全局日历照常前移**、只有这 2 只拿到新 bar。2026-09-08 起连续 4 个交易日 cn_data 每天只落 2 只票 | 按响应 `total` 翻页 + 与 `all.txt` 求并集 + 绝对下限 `MIN_UNIVERSE=2000` |
+| 2 | **校验对"局部落库"失明** | `all.txt` 行数由 copytree 继承必然通过；抽样只抽"刚更新的那几只"（局部落库时必然抽中那几只）→ 校验永远通过 | 新增全量**覆盖面校验**（比对每只票 bin 行数与全局日历对齐比例）+ 抽样改为全 universe 随机 30 |
+| 3 | **Redis 不可达但静默跳过** | `REDIS_URL=host.docker.internal:6379` 而 redis 只绑 127.0.0.1 → 连宿主 IP 必然被拒；写失败**静默降级**，`written=0` 也不报错 | 改走 compose 服务名 `redis://redis:6379/0` |
+
+**两个过程性教训（我自己踩的，代价约 2 次全量抓取 ≈ 3 小时）**：
+- **绝不在长任务运行时重启承载它的容器**：`docker restart` 会杀掉 `docker exec` 进去的任务；
+- **续抓目录不能在正常退出时清理**：`finally: rmtree(csv_dir)` 让"校验失败"这条正常退出
+  把刚抓好的 5206 个 CSV 全删了，续抓成了摆设。只在**自己创建的临时目录**上清理。
+
+**P0 验收（唯一指标）**：Redis 出现 `dfactor:*` ≈ 5500 个，且 athena `GetDaily()` 复活。
+
+---
+
 ## 11. 非目标（明确不做什么，同样重要）
 
 - ❌ **不做自动下单**（手动 → 纪律在你自己手里；且一旦自动下单就必须走程序化交易报告）
@@ -387,5 +430,6 @@ for an array with shape (6, 15095115) and data type float32
 | 组合优化的协方差估计窗口 | 待定（默认 120 日） |
 | 持仓数据的录入方式 | MVP 手工，进阶交割单导入 |
 | 微信告警推送 | 可复用已有 wechat-mcp |
-| 数据源稳定性（东财/腾讯被限流） | hub 已有节流+重试+降级，但需监控 |
+| 数据源稳定性（东财/腾讯被限流） | **已实测**（2026-09-14）：东财 `push2/clist` 返 **502 Bad Gateway**、`82.push2` 与 `push2his` 直接断连；而 push2 单票 / push2ex 涨停池 / datacenter-web / 腾讯 / 新浪均正常。即故障是**逐端点**的。**推论：任何"全市场"结论都必须双源可交叉**（`get_a_trade_universe` 已做东财→腾讯回退） |
+| 因子中性化是否已实现 | **已查实：没做**（`factor_eval.evaluate()` 只做 4 项结构检查；IC 是 `factor_backtest._daily_ic` 的原始截面 Pearson，无去极值/无中性化/非 rank IC）。补它需要**批量行业映射**，而批量行业源正是挂掉的 clist ← 与上一条同源风险 |
 | 是否接自动下单 | 远期议题，**接之前必须先做程序化交易报告** |
