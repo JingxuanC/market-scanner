@@ -132,7 +132,12 @@ T+1 锁的是"当天买的"，**不锁"昨天及以前买的"**。所以有底�
 **athena 的 `factor/cache.go` 直接读它喂 WarRoom**）；`factor:{symbol}` = **盘中**
 （TTL 300s，`batch_compute` 写）。而 `ml_predict` 的快路径读的是 **`factor:`（盘中）**，
 所以日频轨调它大概率走 **on-the-fly 回退**（结果对、但慢）。
-→ P2 开工前必须确认 `batch_compute`（`factor:`）到底有没有在跑。
+→ **已查实（2026-09-14）**：`factor:*` **0 个键**，且 factor-miner 的 17 个工具里
+**没有 `batch_compute`**（只有 `compute_factors` / `factor_daily_compute`），即
+**盘中命名空间没有生产者**。所以日频轨调 `ml_predict` 一定走 on-the-fly 回退
+（结果正确、但慢），**不是**"读 Redis 秒出"。
+→ 决策：P2 **不依赖** `factor:` 快路径；若日后要它，得先给 hub 补一个盘中批量写入者。
+→ 顺带说明 `compute_factors` 是 **ad-hoc 同步计算**（不是批量落库），别当成 `factor:` 的写入者。
 
 **必须确认/补齐**：因子是否做了 **行业 + 市值中性化**。没有中性化，组合会隐性押注行业和市值风格，
 回撤时会集中爆发（2024 年初小市值踩踏就是典型）。→ 列为 Phase 1 的**验收项**。
