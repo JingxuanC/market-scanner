@@ -22,6 +22,20 @@
 - **为什么没修**：hub 的 `portfolio_optimize(symbols, klines, method∈{hrp,equal,min_variance,mean_variance}, lookback)` **没有期望收益/alpha 入参**，§4.4 的 `max αᵀw − λwᵀΣw` hub 给不了。
 - **建议**：在 scanner 本地实现 α 倾斜优化（scipy/cvxpy，带 §8 约束），或请 hub 给 `mean_variance` 加 `mu` 入参。**注意别假装已经有了。**
 
+### B1'. α 倾斜权重：**机制已验证，但集中度未受控**（2026-09-15 实测）
+- 已实现 `scanner/optimize.py::alpha_tilted_weights`（SLSQP 解 max αᵀw − λwᵀΣw，
+  Σw=1、0≤w≤12%），并在 daily 里做成 `weighting="hrp"|"alpha_tilted"`（**默认仍 hrp**）。
+- **机制验证通过**：同一批票同一截面，权重与选择序的秩相关 ρ 从
+  **HRP −0.123** 提到 **α 倾斜 ~+0.99**（λ=0.25~1）。
+- **但集中度调不动**：λ=0.25/0.5/1/2/5 全部是"前 5 合计 60%、前 10 合计 97~100%"，
+  即后 20 只权重≈0 —— 这份"30 只组合"实际只有 ~10 只有仓位，**比 §8 设想的
+  10–20 只分散更集中**。λ 调大还会让 ρ 退化（+0.44/+0.71 非单调）且 SLSQP 不收敛。
+- **结论**：**不能拿它替换默认 HRP**。要修得换路子：协方差收缩（Ledoit-Wolf）、
+  基数约束（最多持 N 只）、或把风险项改成"收益单位"的波动（而非归一化方差）。
+- 中途还修了一处量纲 bug：α 做 z-score 后是 O(1)，而 w'Σw 只有 ~1e-2 量级 →
+  风险项几乎不起作用（当时前 10 名占 100% 仓位、λ 大到起作用又不收敛）。
+  已按对角线均值归一化。
+
 ### B2. 单板块 ≤25% 约束**无法执行**
 - **证据**：`industry_constraint_applied=false`，`industry_max_exposure=1.0`（全落在 UNKNOWN 桶）。
 - **原因**：腾讯兜底（东财 clist 502 时的回退源）不提供行业字段。

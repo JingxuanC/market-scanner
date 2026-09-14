@@ -58,7 +58,13 @@ def alpha_tilted_weights(alpha: dict, returns, lam: float = 2.0,
 
     use = list(cols)
     a = np.array([float(alpha[s]) for s in use], dtype=float)
-    a = (a - a.mean()) / (a.std() + 1e-12)          # 截面 z-score，让 λ 可解释
+    a = (a - a.mean()) / (a.std() + 1e-12)          # 截面 z-score → O(1)
+    # **量纲必须对齐**：w'Σw 在 w~1/n、年化 Σ~0.1 时只有 ~1e-2 量级，而 z-score 后的
+    # αᵀw 是 O(1)；不归一的话风险项几乎不起作用，优化器只会把仓位顶到 max_weight 上限、
+    # 其余全给 0（实测 λ=2/10/50 下"前 10 名占 100% 仓位"），λ 大到能起作用时 SLSQP
+    # 又不收敛。按对角线均值归一后，λ 才是可解释的风险厌恶系数（λ~1 即两项同权）。
+    scale = float(np.mean(np.diag(cov))) or 1.0
+    cov = cov / scale
 
     def neg_util(w):
         return -(a @ w - lam * float(w @ cov @ w))
@@ -77,7 +83,7 @@ def alpha_tilted_weights(alpha: dict, returns, lam: float = 2.0,
                    bounds=[(0.0, max_weight)] * len(use),
                    constraints=[{"type": "eq", "fun": lambda w: w.sum() - 1.0,
                                  "jac": lambda w: np.ones_like(w)}],
-                   options={"maxiter": 500, "ftol": 1e-12})
+                   options={"maxiter": 3000, "ftol": 1e-14})
     if not res.success:
         log.warning("α 倾斜优化未收敛（%s）→ fallback=%s", res.message, fallback)
         return _fallback(syms, fallback)
