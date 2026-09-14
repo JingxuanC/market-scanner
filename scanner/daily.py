@@ -24,6 +24,38 @@ from scanner import hub, store
 log = logging.getLogger("scanner.daily")
 
 
+def apply_weight_cap(weights: dict, max_weight: float) -> "tuple[dict, float]":
+    """把单票权重压到 max_weight 以下且总和仍为 1 → (weights, capped_count)。
+
+    **必须用 water-filling**：先封顶超限的，再把余量只分给未封顶的那些。
+    写成"截断→整体归一"会永远收敛不了（归一又把被封顶的推过线）——2026-09-14 踩过。
+    若 max_weight × n < 1，约束本身不可行，这里**不静默**：返回原权重并把 capped 置 -1，
+    由调用方显式记账。
+    """
+    n = len(weights)
+    if n == 0:
+        return {}, 0
+    if max_weight * n < 1.0 - 1e-9:
+        return dict(weights), -1
+    raw = {k: max(float(v), 0.0) for k, v in weights.items()}
+    total = sum(raw.values()) or 1.0
+    raw = {k: v / total for k, v in raw.items()}
+    out, active, budget, capped = {}, list(raw), 1.0, 0
+    while active:
+        s = sum(raw[k] for k in active) or 1.0
+        scaled = {k: raw[k] * budget / s for k in active}
+        over = [k for k, v in scaled.items() if v > max_weight + 1e-12]
+        if not over:
+            out.update(scaled)
+            break
+        for k in over:
+            out[k] = max_weight
+            budget -= max_weight
+            capped += 1
+            active.remove(k)
+    return out, capped
+
+
 def read_h5(h5_path) -> "object":
     import pandas as pd
 
@@ -70,7 +102,8 @@ def bars_of(sub, symbol: str) -> list:
 def run(h5_path=None, db_path=None, as_of=None, shortlist: int = 200, top_n: int = 40,
         lookback: int = 120, min_symbols: int = 3000, min_amount_wan: float = 5000.0,
         use_ml: bool = True, method: str = "hrp", hub_mod=hub, alpha_source: str = "local",
-        ml_max_symbols: int = 120, df=None, min_universe: int = 500) -> dict:
+        ml_max_symbols: int = 120, df=None, min_universe: int = 500,
+        max_weight: float = 0.12, industry_cap: float = 0.25) -> dict:
     """跑一次日频轨，返回 summary（并落 candidate_pool）。"""
     t0 = time.time()
     warn = []
@@ -138,11 +171,13 @@ def run(h5_path=None, db_path=None, as_of=None, shortlist: int = 200, top_n: int
         warn.append("use_ml=False（本轮未接 ML 打分）")
 
     # 5) 排序取 top_n，再交给 hub 做组合优化（出权重，不是等权）
-    ranked = sorted(short, key=lambda s: (-ml_scores.get(s, float("-inf")), -float(alpha[s])))
+    # 选择序：有 ml 分的按 ml 降序在前，无 ml 分的按 alpha 降序兜底排后
+    ranked = sorted(short, key=lambda x: (-ml_scores.get(x, float("-inf")), -float(alpha[x])))
+    sel_order = {sym: i for i, sym in enumerate(ranked, start=1)}   # 选择序：ml 优先、无 ml 回落 alpha
     pick = ranked[:int(top_n)]
-    klines = {s: bars_of(sub, s) for s in pick}
-    klines = {s: v for s, v in klines.items() if len(v) >= 21}
-    pick = [s for s in pick if s in klines]
+    klines = {sym: bars_of(sub, sym) for sym in pick}
+    klines = {sym: v for sym, v in klines.items() if len(v) >= 21}
+    pick = [sym for sym in pick if sym in klines]
     if len(pick) < 2:
         raise ValueError("组合优化至少需要 2 只有效标的，实际 %d" % len(pick))
     opt = hub_mod.portfolio_optimize(pick, klines, method=method, lookback=lookback)
@@ -150,28 +185,68 @@ def run(h5_path=None, db_path=None, as_of=None, shortlist: int = 200, top_n: int
         raise hub.HubError("组合优化失败: %s" % opt["error"])
     weights = opt.get("weights") or opt.get("target_weights") or opt
     weights = {str(k).upper(): float(v) for k, v in weights.items()
-               if isinstance(v, (int, float))}
+               if isinstance(v, (int, float)) and v >= 0}
 
-    # 6) 落库
+    # 6) §8 风控约束：**能执行的执行，不能执行的显式记账**（不许静默跳过）
+    raw_weights = dict(weights)
+    capped_w, capped_n = apply_weight_cap(raw_weights, max_weight)
+    if capped_n < 0:
+        warn.append("§8 单票上限 %.0f%% × %d 只 = %.0f%% < 100%%，约束**不可行**："
+                    "本轮不做单票截断（需增加持仓数或放宽上限）"
+                    % (100 * max_weight, len(raw_weights), 100 * max_weight * len(raw_weights)))
+        weights = raw_weights
+    else:
+        weights = capped_w
+
+    has_industry = any((by_sym.get(sym, {}).get("industry") or "").strip() for sym in pick)
+    ind_agg = {}
+    for sym in pick:
+        ind = (by_sym.get(sym, {}).get("industry") or "").strip() or "UNKNOWN"
+        ind_agg[ind] = ind_agg.get(ind, 0.0) + weights.get(sym, 0.0)
+    worst = max(ind_agg.values()) if ind_agg else 0.0
+    if not has_industry:
+        warn.append("单板块 %.0f%% 约束**未执行**：本轮 universe 的 industry 全为空"
+                    "（腾讯兜底不提供行业），集中度无法校验" % (100 * industry_cap))
+    elif worst > industry_cap + 1e-9:
+        warn.append("单板块暴露 %.1f%% 超过 §8 上限 %.0f%%（标的选择未做行业中性，"
+                    "这是 §4.2 指出的未中性化风险）" % (100 * worst, 100 * industry_cap))
+
+    # 7) 落库：rank = **选择序**（ml→alpha），reason 里的每个数字都要是真的
     date = as_of.strftime("%Y-%m-%d")
+    ml_rank = {sym: i for i, sym in enumerate(
+        sorted([x for x in pick if x in ml_scores], key=lambda x: -ml_scores[x]), start=1)}
+    trimmed = max(capped_n, 0)
     rows = []
-    for i, s in enumerate(sorted(pick, key=lambda x: -weights.get(x, 0.0)), start=1):
-        info = by_sym.get(s, {})
-        mlv = ml_scores.get(s)
-        reason = "反转20 前%d/%d" % (i, len(pick))
-        reason += " | %s %.1f%%" % (method.upper(), 100 * weights.get(s, 0.0))
-        reason += " | ml " + ("%.4f" % mlv if mlv is not None else "unavailable")
-        rows.append({"symbol": s.lower(), "name": info.get("name"), "alpha": float(alpha.get(s, 0)),
-                     "target_weight": weights.get(s, 0.0), "ml_score": mlv, "rank": i,
+    for sym in sorted(pick, key=lambda x: -weights.get(x, 0.0)):
+        info = by_sym.get(sym, {})
+        mlv = ml_scores.get(sym)
+        reason = "选择序 %d/%d（ml→alpha）" % (sel_order.get(sym, 0), len(ranked))
+        reason += " | alpha %.4f" % float(alpha.get(sym, 0))
+        reason += " | ml " + ("%.5f（第%d/%d）" % (mlv, ml_rank.get(sym, 0), len(ml_scores))
+                             if mlv is not None else "unavailable")
+        reason += " | %s %.2f%%" % (method.upper(), 100 * weights.get(sym, 0.0))
+        if raw_weights.get(sym, 0) > max_weight + 1e-12:
+            reason += "（原 %.2f%% 已按 §8 单票上限 %.0f%% 截断）" % (
+                100 * raw_weights[sym], 100 * max_weight)
+        rows.append({"symbol": sym.lower(), "name": info.get("name"),
+                     "alpha": float(alpha.get(sym, 0)),
+                     "target_weight": weights.get(sym, 0.0), "ml_score": mlv,
+                     "rank": sel_order.get(sym, 0),
                      "reason": reason,
-                     "factor_snapshot": {"reversal20": float(alpha.get(s, 0)),
+                     "factor_snapshot": {"reversal20": float(alpha.get(sym, 0)),
                                          "amount_wan": info.get("amount_wan"),
                                          "industry": info.get("industry")}})
     conn = store.connect(db_path)
     n = store.write_candidates(conn, date, rows)
     conn.close()
-    return {"date": date, "as_of": date, "universe": len(uni_rows),
-            "universe_source": uni.get("source"), "shortlist": len(short),
-            "picked": len(pick), "written": n, "weights_sum": round(sum(weights.values()), 4),
-            "ml_scored": len(ml_scores), "warnings": warn,
-            "elapsed_sec": round(time.time() - t0, 1)}
+    summary = {"date": date, "as_of": date, "universe": len(uni_rows),
+               "universe_source": uni.get("source"), "shortlist": len(short),
+               "picked": len(pick), "written": n,
+               "weights_sum": round(sum(weights.values()), 6),
+               "weights_sum_before_cap": round(sum(raw_weights.values()), 6),
+               "capped_symbols": trimmed,
+               "industry_max_exposure": round(worst, 4),
+               "industry_constraint_applied": bool(has_industry),
+               "ml_scored": len(ml_scores), "warnings": warn,
+               "elapsed_sec": round(time.time() - t0, 1)}
+    return summary

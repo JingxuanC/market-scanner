@@ -107,3 +107,73 @@ def test_run_treats_ok_but_zero_predicted_as_failure(tmp_path):
     assert any("n_predicted=0" in w for w in out["warnings"]), "ok+0 必须被当成失败报出来"
     rows = store.read_candidates(store.connect(tmp_path / "s.db"), out["date"])
     assert all("ml unavailable" in r["reason"] for r in rows)
+
+
+class OverCapHub(FakeHub):
+    """组合优化返回一个超过 §8 单票上限的权重。"""
+    def portfolio_optimize(self, symbols, klines, method="hrp", lookback=120, **kw):
+        w = {s: 0.02 for s in symbols}
+        w[symbols[0]] = 0.5            # 明显超 12% 上限
+        tot = sum(w.values())
+        return {"weights": {k: v / tot for k, v in w.items()}}
+
+
+def test_rank_is_selection_order_and_reason_is_truthful(tmp_path):
+    df = make_df()
+    out = daily.run(db_path=tmp_path / "s.db", df=df, min_symbols=10, shortlist=12,
+                    top_n=6, use_ml=True, hub_mod=FakeHub(), min_universe=10)
+    rows = store.read_candidates(store.connect(tmp_path / "s.db"), out["date"])
+    ranks = sorted(r["rank"] for r in rows)
+    assert ranks == list(range(1, len(rows) + 1)), "rank 必须是唯一的选择序 1..N"
+    # rank 是选择序而不是权重序：按 rank 排出来的权重不必单调
+    for r in rows:
+        assert "选择序" in r["reason"] and "alpha " in r["reason"]
+        assert "ml " in r["reason"]
+
+
+def test_max_weight_cap_is_enforced_and_reported(tmp_path):
+    df = make_df()
+    out = daily.run(db_path=tmp_path / "s.db", df=df, min_symbols=10, shortlist=14,
+                    top_n=12, use_ml=False, max_weight=0.12, hub_mod=OverCapHub(),
+                    min_universe=10)
+    rows = store.read_candidates(store.connect(tmp_path / "s.db"), out["date"])
+    assert all(r["target_weight"] <= 0.12 + 1e-9 for r in rows), "§8 单票上限必须落地"
+    assert abs(sum(r["target_weight"] for r in rows) - 1.0) < 1e-6, "截断后必须重新归一"
+    assert out["capped_symbols"] >= 1
+    hit = [r for r in rows if "截断" in r["reason"]]
+    assert hit, "被截断的票必须在 reason 里写明（不许静默改权重）"
+
+
+def test_industry_constraint_reported_when_unknown(tmp_path):
+    """腾讯兜底没有行业 → 集中度约束无法执行，必须显式写在 warnings 里。"""
+    df = make_df()
+
+    class NoIndustry(FakeHub):
+        def trade_universe(self, **kw):
+            u = super().trade_universe(**kw)
+            for r in u["universe"]:
+                r["industry"] = ""
+            return u
+
+    out = daily.run(db_path=tmp_path / "s.db", df=df, min_symbols=10, shortlist=12,
+                    top_n=6, use_ml=False, hub_mod=NoIndustry(), min_universe=10)
+    assert out["industry_constraint_applied"] is False
+    assert any("约束**未执行**" in w for w in out["warnings"])
+
+
+def test_apply_weight_cap_water_filling():
+    """water-filling：只封顶超限的，余量分给未封顶的；不是整体归一。"""
+    w, c = daily.apply_weight_cap({"a": 0.9, "b": 0.05, "c": 0.05}, 0.5)
+    assert c == 1 and abs(sum(w.values()) - 1.0) < 1e-9
+    assert w["a"] == 0.5 and abs(w["b"] - 0.25) < 1e-9 and abs(w["c"] - 0.25) < 1e-9
+    # 迭代式：5 只 × 25% = 125% 可行；截断 a 后 b 也超限 → 继续迭代
+    w2, c2 = daily.apply_weight_cap({"a": 0.6, "b": 0.2, "c": 0.1, "d": 0.05, "e": 0.05}, 0.25)
+    assert c2 >= 1
+    assert all(v <= 0.25 + 1e-9 for v in w2.values()) and abs(sum(w2.values()) - 1.0) < 1e-9
+
+
+def test_apply_weight_cap_infeasible_is_flagged():
+    """12% × 6 只 = 72% < 100% → 不可行，返回 -1 让调用方显式记账，而不是硬凑。"""
+    w, c = daily.apply_weight_cap({k: 1/6 for k in "abcdef"}, 0.12)
+    assert c == -1
+    assert abs(sum(w.values()) - 1.0) < 1e-9

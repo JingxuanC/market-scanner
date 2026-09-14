@@ -36,3 +36,33 @@ def test_upsert_updates_fields(tmp_path):
     store.write_candidates(conn, "2026-09-14", [{"symbol": "sh600519", "target_weight": 0.09}])
     row = conn.execute("SELECT target_weight FROM candidate_pool").fetchone()
     assert row["target_weight"] == 0.09
+
+
+def test_rewrite_same_date_replaces_whole_set(tmp_path):
+    """同一天重跑必须**整日替换**：只 upsert 会让上一轮的落选标的残留，
+    导致权重合计 >1、集中度失真（2026-09-14 实测 39 行 / 1.3448）。
+    旧测试只写了"同一只写两次"，测不到这个。"""
+    conn = store.connect(tmp_path / "s.db")
+    store.write_candidates(conn, "2026-09-14", [
+        {"symbol": "sh600001", "target_weight": 0.5},
+        {"symbol": "sh600002", "target_weight": 0.3},
+        {"symbol": "sh600003", "target_weight": 0.2}])
+    assert abs(sum(r["target_weight"] for r in store.read_candidates(conn, "2026-09-14")) - 1.0) < 1e-9
+    # 第二轮：换了标的集（600003 掉出，600004 进）
+    store.write_candidates(conn, "2026-09-14", [
+        {"symbol": "sh600001", "target_weight": 0.6},
+        {"symbol": "sh600004", "target_weight": 0.4}])
+    out = store.read_candidates(conn, "2026-09-14")
+    assert [r["symbol"] for r in out] == ["sh600001", "sh600004"], "600003 必须被清掉"
+    assert abs(sum(r["target_weight"] for r in out) - 1.0) < 1e-9
+    # 另一个日期不受影响
+    store.write_candidates(conn, "2026-09-15", [{"symbol": "sh600009", "target_weight": 1.0}])
+    assert len(store.read_candidates(conn, "2026-09-14")) == 2
+
+
+def test_universe_rewrite_replaces_day(tmp_path):
+    conn = store.connect(tmp_path / "s.db")
+    store.write_universe(conn, "2026-09-14", [{"symbol": "sh600001"}, {"symbol": "sh600002"}])
+    store.write_universe(conn, "2026-09-14", [{"symbol": "sh600002"}, {"symbol": "sh600003"}])
+    got = {r["symbol"] for r in conn.execute("SELECT symbol FROM universe WHERE date='2026-09-14'")}
+    assert got == {"sh600002", "sh600003"}, "旧行必须清掉"

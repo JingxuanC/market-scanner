@@ -60,16 +60,27 @@ def _upsert(conn: sqlite3.Connection, table: str, rows: list, cols: list) -> int
 
 
 def write_universe(conn, date: str, rows: list) -> int:
-    """落可交易域。行字段来自 get_a_trade_universe 的 universe[]（同名对齐）。"""
+    """落可交易域。行字段来自 get_a_trade_universe 的 universe[]（同名对齐）。
+
+    先删该日旧行再写：**同一天重跑必须得到同一份结果**。只 upsert 的话，
+    掉出榜单的旧 symbol 会留在库里 → 权重和 >1、集中度失真（2026-09-14 实测
+    同一 date 累积成 39 行、权重合计 1.3448）。
+    """
     cols = ["date", "symbol", "name", "price", "change_pct", "amount_wan",
             "turnover_pct", "mktcap_yi", "industry", "list_date", "source"]
+    conn.execute("DELETE FROM universe WHERE date=?", (date,))
     return _upsert(conn, "universe", [dict(r, date=date) for r in rows], cols)
 
 
 def write_candidates(conn, date: str, rows: list) -> int:
-    """落候选池。factor_snapshot 允许传 dict（自动转 JSON），便于复盘回读。"""
+    """落候选池（**整日替换**）。factor_snapshot 允许传 dict（自动转 JSON），便于复盘回读。
+
+    先删该日旧行：候选池表达的是一份完整组合，重复跑只 upsert 会让上一轮的
+    落选标的残留 → 权重合计 >1、单板块集中度算错。整日替换才幂等。
+    """
     cols = ["date", "symbol", "name", "alpha", "target_weight",
             "factor_snapshot", "ml_score", "rank", "reason"]
+    conn.execute("DELETE FROM candidate_pool WHERE date=?", (date,))
     norm = []
     for r in rows:
         d = dict(r, date=date)

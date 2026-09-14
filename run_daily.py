@@ -21,7 +21,9 @@ class HubWithLocalOptimizer:
         return hub.trade_universe(**kw)
 
     def ml_predict(self, kl, **kw):
-        return hub.ml_predict(kl, **kw)
+        # 同上：走本地模块以拿到刚修的 trainer（服务进程还持有旧模块）
+        import trainer  # noqa: PLC0415
+        return trainer.get_trainer().predict(kl)
 
     def portfolio_optimize(self, symbols, klines, method="hrp", lookback=120, **kw):
         import analytics  # noqa: PLC0415 — 与 hub 服务暴露的是同一个函数
