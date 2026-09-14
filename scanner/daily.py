@@ -103,7 +103,8 @@ def run(h5_path=None, db_path=None, as_of=None, shortlist: int = 200, top_n: int
         lookback: int = 120, min_symbols: int = 3000, min_amount_wan: float = 5000.0,
         use_ml: bool = True, method: str = "hrp", hub_mod=hub, alpha_source: str = "local",
         ml_max_symbols: int = 120, df=None, min_universe: int = 500,
-        max_weight: float = 0.12, industry_cap: float = 0.25) -> dict:
+        max_weight: float = 0.12, industry_cap: float = 0.25,
+        ranking: str = "alpha") -> dict:
     """跑一次日频轨，返回 summary（并落 candidate_pool）。"""
     t0 = time.time()
     warn = []
@@ -171,8 +172,19 @@ def run(h5_path=None, db_path=None, as_of=None, shortlist: int = 200, top_n: int
         warn.append("use_ml=False（本轮未接 ML 打分）")
 
     # 5) 排序取 top_n，再交给 hub 做组合优化（出权重，不是等权）
-    # 选择序：有 ml 分的按 ml 降序在前，无 ml 分的按 alpha 降序兜底排后
-    ranked = sorted(short, key=lambda x: (-ml_scores.get(x, float("-inf")), -float(alpha[x])))
+    # 选择序的**依据**必须是有证据的那个：
+    #   alpha  —— 反转20，有实测 IC（factor_recent_ic +0.053）→ 默认
+    #   ml     —— 仅当 ml_metrics 里真有 OOS 指标（ic/rank_ic）时才该用；
+    #             2026-09-15 实测 ml_metrics 返回 {model_exists: true, metrics: {}}（空），
+    #             那等于用未验证信号定序，所以不设为默认。
+    if ranking == "ml":
+        ranked = sorted(short, key=lambda x: (-ml_scores.get(x, float("-inf")), -float(alpha[x])))
+        basis = "ml→alpha（需 ml_metrics 有 OOS 指标才成立）"
+        if not ml_scores:
+            warn.append("ranking=ml 但本轮没有任何 ml 分，实际退化为 alpha 排序")
+    else:
+        ranked = sorted(short, key=lambda x: -float(alpha[x]))
+        basis = "alpha(reversal20，实测 IC +0.053)"
     sel_order = {sym: i for i, sym in enumerate(ranked, start=1)}   # 选择序：ml 优先、无 ml 回落 alpha
     pick = ranked[:int(top_n)]
     klines = {sym: bars_of(sub, sym) for sym in pick}
@@ -220,7 +232,7 @@ def run(h5_path=None, db_path=None, as_of=None, shortlist: int = 200, top_n: int
     for sym in sorted(pick, key=lambda x: -weights.get(x, 0.0)):
         info = by_sym.get(sym, {})
         mlv = ml_scores.get(sym)
-        reason = "选择序 %d/%d（ml→alpha）" % (sel_order.get(sym, 0), len(ranked))
+        reason = "选择序 %d/%d（依据 %s）" % (sel_order.get(sym, 0), len(ranked), basis)
         reason += " | alpha %.4f" % float(alpha.get(sym, 0))
         reason += " | ml " + ("%.5f（第%d/%d）" % (mlv, ml_rank.get(sym, 0), len(ml_scores))
                              if mlv is not None else "unavailable")
@@ -247,6 +259,7 @@ def run(h5_path=None, db_path=None, as_of=None, shortlist: int = 200, top_n: int
                "capped_symbols": trimmed,
                "industry_max_exposure": round(worst, 4),
                "industry_constraint_applied": bool(has_industry),
+               "ranking_basis": basis, "ranking_mode": ranking,
                "ml_scored": len(ml_scores), "warnings": warn,
                "elapsed_sec": round(time.time() - t0, 1)}
     return summary

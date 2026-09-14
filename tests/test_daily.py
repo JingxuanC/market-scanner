@@ -177,3 +177,23 @@ def test_apply_weight_cap_infeasible_is_flagged():
     w, c = daily.apply_weight_cap({k: 1/6 for k in "abcdef"}, 0.12)
     assert c == -1
     assert abs(sum(w.values()) - 1.0) < 1e-9
+
+
+def test_ranking_basis_defaults_to_alpha_and_ml_is_not_used_for_order(tmp_path):
+    """默认用**有实测 IC 的 alpha** 定序；ML 只记录不定序（ml_metrics 无 OOS 证据）。"""
+    df = make_df()
+
+    class SkewedMl(FakeHub):
+        """ML 分与 alpha 反相关：若用它定序，选择序会完全反过来。"""
+        def ml_predict(self, klines_list, **kw):
+            return {"status": "ok", "n_predicted": len(klines_list),
+                    "predictions": {k["symbol"]: -i for i, k in enumerate(klines_list)}}
+
+    out = daily.run(db_path=tmp_path / "s.db", df=df, min_symbols=10, shortlist=12,
+                    top_n=6, use_ml=True, hub_mod=SkewedMl(), min_universe=10)
+    assert out["ranking_mode"] == "alpha"
+    assert "alpha(" in out["ranking_basis"]
+    rows = store.read_candidates(store.connect(tmp_path / "s.db"), out["date"])
+    r1 = [r for r in rows if r["rank"] == 1][0]
+    assert r1["alpha"] == max(x["alpha"] for x in rows), "rank=1 必须是 alpha 最高的"
+    assert all("依据 alpha(" in r["reason"] for r in rows)
