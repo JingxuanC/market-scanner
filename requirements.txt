@@ -1,0 +1,5 @@
+# 日频轨读 h5 用（与 factor-miner 同版本族）
+pandas>=2.0
+numpy>=1.26,<2
+tables>=3.8
+requests>=2.31
