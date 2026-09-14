@@ -11,9 +11,14 @@ import json
 import os
 import urllib.request
 
+# 服务地址可按环境覆盖：**容器里必须用 compose 服务名**。
+# 容器内的 127.0.0.1 不是宿主，而这些服务端口只绑在宿主的 127.0.0.1 上
+# （与 redis 那次 `host.docker.internal` 连不通是同一个坑）。
 SERVICES = {
-    "astock-data": ("127.0.0.1", 50052),
-    "factor-miner": ("127.0.0.1", 50053),
+    "astock-data": (os.environ.get("ASTOCK_DATA_HOST", "127.0.0.1"),
+                    int(os.environ.get("ASTOCK_DATA_PORT", "50052"))),
+    "factor-miner": (os.environ.get("FACTOR_MINER_HOST", "127.0.0.1"),
+                     int(os.environ.get("FACTOR_MINER_PORT", "50053"))),
 }
 
 
