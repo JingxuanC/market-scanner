@@ -214,5 +214,6 @@ def test_weighting_alpha_tilted_puts_more_on_top_alpha(tmp_path):
     assert abs(sum(r["target_weight"] for r in ra) - 1.0) < 1e-6
     assert all(r["target_weight"] <= 0.5 + 1e-9 for r in ra)
     top = [r for r in ra if r["rank"] == 1][0]
-    assert top["target_weight"] == max(r["target_weight"] for r in ra), \
-        "α 倾斜下 rank=1（alpha 最高）必须拿到最大权重"
+    assert top["target_weight"] == pytest.approx(
+        max(r["target_weight"] for r in ra), abs=1e-9), \
+        "α 倾斜下 rank=1（alpha 最高）必须拿到最大权重"   # 多只并列在 cap 上，别用浮点相等
