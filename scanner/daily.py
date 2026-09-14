@@ -19,7 +19,7 @@ import logging
 import time
 from pathlib import Path
 
-from scanner import hub, store
+from scanner import hub, optimize, store
 
 log = logging.getLogger("scanner.daily")
 
@@ -104,7 +104,7 @@ def run(h5_path=None, db_path=None, as_of=None, shortlist: int = 200, top_n: int
         use_ml: bool = True, method: str = "hrp", hub_mod=hub, alpha_source: str = "local",
         ml_max_symbols: int = 120, df=None, min_universe: int = 500,
         max_weight: float = 0.12, industry_cap: float = 0.25,
-        ranking: str = "alpha") -> dict:
+        ranking: str = "alpha", weighting: str = "hrp", lam: float = 2.0) -> dict:
     """跑一次日频轨，返回 summary（并落 candidate_pool）。"""
     t0 = time.time()
     warn = []
@@ -192,12 +192,21 @@ def run(h5_path=None, db_path=None, as_of=None, shortlist: int = 200, top_n: int
     pick = [sym for sym in pick if sym in klines]
     if len(pick) < 2:
         raise ValueError("组合优化至少需要 2 只有效标的，实际 %d" % len(pick))
-    opt = hub_mod.portfolio_optimize(pick, klines, method=method, lookback=lookback)
-    if isinstance(opt, dict) and opt.get("error"):
-        raise hub.HubError("组合优化失败: %s" % opt["error"])
-    weights = opt.get("weights") or opt.get("target_weights") or opt
-    weights = {str(k).upper(): float(v) for k, v in weights.items()
-               if isinstance(v, (int, float)) and v >= 0}
+    if weighting == "alpha_tilted":
+        # B1 的正解：本地做 max αᵀw − λwᵀΣw（含 §8 单票上限），让权重反映"多看好"，
+        # 而不只是相关性。hub 的 portfolio_optimize 没有期望收益入参，做不了这件事。
+        rets = px[[c for c in pick if c in px.columns]].pct_change().dropna(how="all")
+        weights = optimize.alpha_tilted_weights(
+            {s: float(alpha.get(s, 0.0)) for s in pick}, rets,
+            lam=float(lam), max_weight=float(max_weight))
+        method = "alpha_tilted"
+    else:
+        opt = hub_mod.portfolio_optimize(pick, klines, method=method, lookback=lookback)
+        if isinstance(opt, dict) and opt.get("error"):
+            raise hub.HubError("组合优化失败: %s" % opt["error"])
+        weights = opt.get("weights") or opt.get("target_weights") or opt
+        weights = {str(k).upper(): float(v) for k, v in weights.items()
+                   if isinstance(v, (int, float)) and v >= 0}
 
     # 6) §8 风控约束：**能执行的执行，不能执行的显式记账**（不许静默跳过）
     raw_weights = dict(weights)
@@ -260,6 +269,7 @@ def run(h5_path=None, db_path=None, as_of=None, shortlist: int = 200, top_n: int
                "industry_max_exposure": round(worst, 4),
                "industry_constraint_applied": bool(has_industry),
                "ranking_basis": basis, "ranking_mode": ranking,
+               "weighting": weighting, "lambda": lam,
                "ml_scored": len(ml_scores), "warnings": warn,
                "elapsed_sec": round(time.time() - t0, 1)}
     return summary

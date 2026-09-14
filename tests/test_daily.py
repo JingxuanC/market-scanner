@@ -197,3 +197,22 @@ def test_ranking_basis_defaults_to_alpha_and_ml_is_not_used_for_order(tmp_path):
     r1 = [r for r in rows if r["rank"] == 1][0]
     assert r1["alpha"] == max(x["alpha"] for x in rows), "rank=1 必须是 alpha 最高的"
     assert all("依据 alpha(" in r["reason"] for r in rows)
+
+
+def test_weighting_alpha_tilted_puts_more_on_top_alpha(tmp_path):
+    """B1 的正解：α 倾斜优化必须让 alpha 最高的票拿到更多权重（HRP 做不到这点）。
+    同一批票、同一个截面，只换 weighting，比较两者的集中度。"""
+    df = make_df()
+    out_h = daily.run(db_path=tmp_path / "h.db", df=df, min_symbols=10, shortlist=14,
+                      top_n=12, use_ml=False, weighting="hrp", max_weight=0.5,
+                      hub_mod=OverCapHub(), min_universe=10)
+    out_a = daily.run(db_path=tmp_path / "a.db", df=df, min_symbols=10, shortlist=14,
+                      top_n=12, use_ml=False, weighting="alpha_tilted", max_weight=0.5,
+                      lam=0.5, hub_mod=OverCapHub(), min_universe=10)   # ← 漏了这个就会去打真实 hub
+    assert out_a["weighting"] == "alpha_tilted" and out_h["weighting"] == "hrp"
+    ra = store.read_candidates(store.connect(tmp_path / "a.db"), out_a["date"])
+    assert abs(sum(r["target_weight"] for r in ra) - 1.0) < 1e-6
+    assert all(r["target_weight"] <= 0.5 + 1e-9 for r in ra)
+    top = [r for r in ra if r["rank"] == 1][0]
+    assert top["target_weight"] == max(r["target_weight"] for r in ra), \
+        "α 倾斜下 rank=1（alpha 最高）必须拿到最大权重"
